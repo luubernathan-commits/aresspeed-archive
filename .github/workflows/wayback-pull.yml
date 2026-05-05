@@ -11,6 +11,10 @@ on:
         description: Folder to write images into
         required: true
         default: site
+      subdir:
+        description: Subfolder under target_dir for the pull
+        required: true
+        default: _wayback_pull_clean
 
 jobs:
   pull:
@@ -21,40 +25,74 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install jq + wget
-        run: sudo apt-get update && sudo apt-get install -y jq wget
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-      - name: Fetch Wayback CDX image inventory
+      - name: Fetch CDX inventory + download with clean paths
         run: |
-          mkdir -p tools
-          curl -sS "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.domain }}/*&output=json&filter=mimetype:image/.*&fl=original,timestamp&collapse=urlkey" \
-            | jq -r '.[1:][] | "https://web.archive.org/web/\(.[1])id_/\(.[0])"' \
-            > tools/ares_images.txt
-          echo "Total URLs:" $(wc -l < tools/ares_images.txt)
-          head -5 tools/ares_images.txt
+          python - <<'PY'
+          import json, os, sys, time, urllib.parse, urllib.request, pathlib
 
-      - name: Download images (preserve folder structure)
-        run: |
-          mkdir -p ${{ github.event.inputs.target_dir }}/_wayback_pull
-          cd ${{ github.event.inputs.target_dir }}/_wayback_pull
-          wget -i ../../tools/ares_images.txt \
-               --force-directories \
-               --no-host-directories \
-               --cut-dirs=2 \
-               --adjust-extension \
-               --content-disposition \
-               --restrict-file-names=windows \
-               -e robots=off \
-               --wait=1 --random-wait \
-               --tries=3 --timeout=30 \
-               -U "Mozilla/5.0 (compatible; AresSpeedArchiveBot/1.0)" \
-            || echo "wget finished with non-zero exit (some 404s expected)"
-          echo "Files pulled:" $(find . -type f | wc -l)
+          DOMAIN  = "${{ github.event.inputs.domain }}"
+          TARGET  = "${{ github.event.inputs.target_dir }}"
+          SUBDIR  = "${{ github.event.inputs.subdir }}"
+          OUTROOT = pathlib.Path(TARGET) / SUBDIR
+          OUTROOT.mkdir(parents=True, exist_ok=True)
+          pathlib.Path("tools").mkdir(exist_ok=True)
+
+          cdx = (
+              f"https://web.archive.org/cdx/search/cdx?url={DOMAIN}/*"
+              "&output=json&filter=mimetype:image/.*"
+              "&fl=original,timestamp&collapse=urlkey"
+          )
+          print("CDX:", cdx)
+          req = urllib.request.Request(cdx, headers={"User-Agent": "AresSpeedArchiveBot/2.0"})
+          with urllib.request.urlopen(req, timeout=60) as r:
+              rows = json.load(r)[1:]
+          print(f"Total URLs: {len(rows)}")
+
+          # Persist URL list for reproducibility
+          with open("tools/ares_images.txt", "w") as f:
+              for original, ts in rows:
+                  f.write(f"https://web.archive.org/web/{ts}id_/{original}\n")
+
+          ok = fail = skip = 0
+          for i, (original, ts) in enumerate(rows, 1):
+              parsed = urllib.parse.urlparse(original)
+              # Clean path: strip leading slash, decode %xx, drop :80 host suffixes
+              rel = urllib.parse.unquote(parsed.path.lstrip("/"))
+              if not rel:
+                  rel = "index_image"
+              # Sanitise illegal characters for any FS
+              rel = rel.replace(":", "_").replace("?", "_").replace("*", "_").replace('"', "_").replace("<", "_").replace(">", "_").replace("|", "_")
+              out = OUTROOT / rel
+              if out.exists() and out.stat().st_size > 0:
+                  skip += 1
+                  continue
+              out.parent.mkdir(parents=True, exist_ok=True)
+              wb = f"https://web.archive.org/web/{ts}id_/{original}"
+              try:
+                  req2 = urllib.request.Request(wb, headers={"User-Agent": "AresSpeedArchiveBot/2.0"})
+                  with urllib.request.urlopen(req2, timeout=45) as r:
+                      data = r.read()
+                  out.write_bytes(data)
+                  ok += 1
+                  if i % 25 == 0:
+                      print(f"[{i}/{len(rows)}] ok={ok} fail={fail} skip={skip}  last={rel}")
+              except Exception as e:
+                  fail += 1
+                  print(f"FAIL {wb}: {e}")
+              time.sleep(0.8)
+
+          print(f"DONE  ok={ok}  fail={fail}  skip={skip}  total={len(rows)}")
+          PY
 
       - name: Commit pulled images
         run: |
           git config user.name  "wayback-bot"
           git config user.email "wayback-bot@users.noreply.github.com"
-          git add tools/ares_images.txt ${{ github.event.inputs.target_dir }}/_wayback_pull
-          git commit -m "Wayback pull: ${{ github.event.inputs.domain }} ($(date -u +%Y-%m-%d))" || echo "Nothing to commit"
+          git add tools/ares_images.txt "${{ github.event.inputs.target_dir }}/${{ github.event.inputs.subdir }}"
+          git commit -m "Wayback pull v2 (clean paths): ${{ github.event.inputs.domain }} ($(date -u +%Y-%m-%d))" || echo "Nothing to commit"
           git push
