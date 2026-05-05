@@ -1,0 +1,60 @@
+name: Wayback Image Pull
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: Domain to mirror from Wayback (no protocol)
+        required: true
+        default: aresspeed.com.au
+      target_dir:
+        description: Folder to write images into
+        required: true
+        default: site
+
+jobs:
+  pull:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install jq + wget
+        run: sudo apt-get update && sudo apt-get install -y jq wget
+
+      - name: Fetch Wayback CDX image inventory
+        run: |
+          mkdir -p tools
+          curl -sS "https://web.archive.org/cdx/search/cdx?url=${{ github.event.inputs.domain }}/*&output=json&filter=mimetype:image/.*&fl=original,timestamp&collapse=urlkey" \
+            | jq -r '.[1:][] | "https://web.archive.org/web/\(.[1])id_/\(.[0])"' \
+            > tools/ares_images.txt
+          echo "Total URLs:" $(wc -l < tools/ares_images.txt)
+          head -5 tools/ares_images.txt
+
+      - name: Download images (preserve folder structure)
+        run: |
+          mkdir -p ${{ github.event.inputs.target_dir }}/_wayback_pull
+          cd ${{ github.event.inputs.target_dir }}/_wayback_pull
+          wget -i ../../tools/ares_images.txt \
+               --force-directories \
+               --no-host-directories \
+               --cut-dirs=2 \
+               --adjust-extension \
+               --content-disposition \
+               --restrict-file-names=windows \
+               -e robots=off \
+               --wait=1 --random-wait \
+               --tries=3 --timeout=30 \
+               -U "Mozilla/5.0 (compatible; AresSpeedArchiveBot/1.0)" \
+            || echo "wget finished with non-zero exit (some 404s expected)"
+          echo "Files pulled:" $(find . -type f | wc -l)
+
+      - name: Commit pulled images
+        run: |
+          git config user.name  "wayback-bot"
+          git config user.email "wayback-bot@users.noreply.github.com"
+          git add tools/ares_images.txt ${{ github.event.inputs.target_dir }}/_wayback_pull
+          git commit -m "Wayback pull: ${{ github.event.inputs.domain }} ($(date -u +%Y-%m-%d))" || echo "Nothing to commit"
+          git push
