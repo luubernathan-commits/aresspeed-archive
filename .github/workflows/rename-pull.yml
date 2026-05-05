@@ -1,0 +1,95 @@
+name: Rename Wayback Pull (clean paths)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_dir:
+        description: Existing messy pull directory
+        required: true
+        default: site/_wayback_pull
+      dest_dir:
+        description: New clean directory to write to
+        required: true
+        default: site/_wayback_pull_clean
+
+jobs:
+  rename:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Rename URL-encoded files into clean original paths
+        run: |
+          python -u - <<'PY'
+          import os, sys, urllib.parse, pathlib, shutil
+
+          SRC  = pathlib.Path("${{ github.event.inputs.source_dir }}")
+          DEST = pathlib.Path("${{ github.event.inputs.dest_dir }}")
+          DEST.mkdir(parents=True, exist_ok=True)
+
+          if not SRC.exists():
+              print(f"ERROR: source dir {SRC} does not exist")
+              sys.exit(1)
+
+          ok = skip = bad = 0
+          for f in SRC.rglob("*"):
+              if not f.is_file():
+                  continue
+              # The wget output had names like:
+              # site/_wayback_pull/http%3A/aresspeed.com.au%3A80/dragcombat/images/122-2287_IMG.jpg
+              # We want to strip the protocol+host segments and keep the path.
+              rel_parts = f.relative_to(SRC).parts
+              # Decode each segment
+              decoded = [urllib.parse.unquote(p) for p in rel_parts]
+              # Drop leading 'http:' or 'https:' (now ':' is restored after decode)
+              if decoded and decoded[0].lower().rstrip(':') in ("http", "https"):
+                  decoded = decoded[1:]
+              # Drop empty segments and host:port (contains '.com' / '.au' / ':80')
+              cleaned = []
+              host_dropped = False
+              for seg in decoded:
+                  if not seg:
+                      continue
+                  if not host_dropped and (":80" in seg or "aresspeed" in seg.lower() or seg.endswith(".com.au") or seg.endswith(".au")):
+                      host_dropped = True
+                      continue
+                  cleaned.append(seg)
+              if not cleaned:
+                  bad += 1
+                  print(f"BAD path, skipping: {f}")
+                  continue
+              # Sanitise FS-illegal chars
+              safe = []
+              for seg in cleaned:
+                  s = seg
+                  for ch in [':', '?', '*', '"', '<', '>', '|']:
+                      s = s.replace(ch, '_')
+                  safe.append(s)
+              dest_path = DEST.joinpath(*safe)
+              if dest_path.exists() and dest_path.stat().st_size > 0:
+                  skip += 1
+                  continue
+              dest_path.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(f, dest_path)
+              ok += 1
+              if ok % 50 == 0:
+                  print(f"copied={ok} skip={skip} bad={bad}  last={dest_path}")
+
+          print(f"DONE  copied={ok}  skipped={skip}  bad={bad}")
+          PY
+
+      - name: Commit cleaned tree
+        run: |
+          git config user.name  "wayback-bot"
+          git config user.email "wayback-bot@users.noreply.github.com"
+          git add "${{ github.event.inputs.dest_dir }}"
+          git commit -m "Rename Wayback pull to clean paths ($(date -u +%Y-%m-%d))" || echo "Nothing to commit"
+          git push
