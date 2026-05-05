@@ -1,0 +1,117 @@
+name: Diff & Merge Wayback Pull
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_merge:
+        description: 'If true, copy net-new files from clean pull into site/ tree'
+        required: false
+        default: 'false'
+
+jobs:
+  diff-merge:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Diff clean pull vs site
+        run: |
+          python -u <<'PY'
+          import os, hashlib, json, shutil, sys
+          CLEAN = 'site/_wayback_pull_clean'
+          SITE = 'site'
+          REPORT_DIR = 'tools/diff_reports'
+          os.makedirs(REPORT_DIR, exist_ok=True)
+
+          def sha1(path):
+              h = hashlib.sha1()
+              with open(path,'rb') as f:
+                  for chunk in iter(lambda: f.read(65536), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def walk(root):
+              out = {}
+              for dp, _, fns in os.walk(root):
+                  for fn in fns:
+                      full = os.path.join(dp, fn)
+                      rel = os.path.relpath(full, root)
+                      out[rel.replace(os.sep,'/')] = full
+              return out
+
+          clean_files = walk(CLEAN) if os.path.isdir(CLEAN) else {}
+          # Build site map but EXCLUDE the clean pull subtree itself
+          site_files = {}
+          if os.path.isdir(SITE):
+              for dp, _, fns in os.walk(SITE):
+                  if '_wayback_pull_clean' in dp.split(os.sep):
+                      continue
+                  for fn in fns:
+                      full = os.path.join(dp, fn)
+                      rel = os.path.relpath(full, SITE).replace(os.sep,'/')
+                      site_files[rel] = full
+
+          new_only = []
+          same = []
+          differ = []
+          for rel, full in clean_files.items():
+              if rel in site_files:
+                  try:
+                      if sha1(full) == sha1(site_files[rel]):
+                          same.append(rel)
+                      else:
+                          differ.append(rel)
+                  except Exception as e:
+                      differ.append(rel+f' (err:{e})')
+              else:
+                  new_only.append(rel)
+
+          summary = {
+              'clean_total': len(clean_files),
+              'site_total': len(site_files),
+              'new_only': len(new_only),
+              'same': len(same),
+              'differ': len(differ),
+          }
+          print('SUMMARY', json.dumps(summary), flush=True)
+
+          with open(os.path.join(REPORT_DIR,'summary.json'),'w') as f:
+              json.dump(summary, f, indent=2)
+          with open(os.path.join(REPORT_DIR,'new_only.txt'),'w') as f:
+              f.write('\n'.join(sorted(new_only)))
+          with open(os.path.join(REPORT_DIR,'differ.txt'),'w') as f:
+              f.write('\n'.join(sorted(differ)))
+          with open(os.path.join(REPORT_DIR,'same.txt'),'w') as f:
+              f.write('\n'.join(sorted(same)))
+
+          apply_merge = os.environ.get('APPLY_MERGE','false').lower() == 'true'
+          if apply_merge:
+              merged = 0
+              for rel in new_only:
+                  src = clean_files[rel]
+                  dst = os.path.join(SITE, rel)
+                  os.makedirs(os.path.dirname(dst), exist_ok=True)
+                  shutil.copy2(src, dst)
+                  merged += 1
+              print(f'MERGED {merged} new files into {SITE}/', flush=True)
+          else:
+              print('Dry run only. Set apply_merge=true to copy net-new files.', flush=True)
+          PY
+        env:
+          APPLY_MERGE: ${{ inputs.apply_merge }}
+
+      - name: Commit reports & merged files
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add tools/diff_reports site || true
+          git commit -m 'diff-merge: report + optional merge' || echo 'nothing to commit'
+          git push || true
